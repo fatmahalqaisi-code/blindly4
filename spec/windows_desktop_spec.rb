@@ -3,6 +3,36 @@ require 'support/desktop_fixture'
 RSpec.describe 'Windows desktop behavior', :windows, :live do
   include_context 'a native desktop fixture'
 
+  it 'hands foreground between separate processes without modifying either draft' do
+    other = Process.spawn({'BLINDLY4_FIXTURE_BACKGROUND' => '1'}, [fixture_binary, fixture_binary], '--test-app',
+                          in: File::NULL, out: File::NULL, err: File::NULL)
+    wait_for_observed_state('Second background fixture ready') do
+      result = cli('find', '--pid', other, '--title', 'Fixture ready', '--role', 'AXStaticText')
+      result.status == 0 && result.json.fetch('matches').any?
+    end
+    # Deliver input to the current foreground process before each fresh CLI
+    # switches away, rather than relying on an expired foreground-lock timeout.
+    app('key', '--key', 'escape')
+    [other, @fixture_pid, other, @fixture_pid].each do |pid|
+      result = cli('activate', '--pid', pid, '--profile')
+      expect(result.status).to eq(0), result.stdout
+      expect(result.json).to include('ok' => true, 'pid' => pid)
+      expect(JSON.parse(result.stderr).fetch('activation')).to include('targetPid' => pid, 'activationAccepted' => true)
+      expect(success('apps').fetch('apps')).to include(a_hash_including('pid' => pid, 'frontmost' => true))
+      success('key', '--pid', pid, '--key', 'escape')
+    end
+    [other, @fixture_pid].each do |pid|
+      fields = success('find', '--pid', pid, '--title', 'Draft', '--role', 'AXTextField').fetch('matches')
+      expect(fields).to include(a_hash_including('title' => 'Draft', 'value' => ''))
+      expect(success('find', '--pid', pid, '--title', 'Not submitted').fetch('matches')).not_to be_empty
+    end
+  ensure
+    if other
+      Process.kill('KILL', other)
+      Process.waitpid(other)
+    end
+  end
+
   it 'reports matching native control types, roles, and supported actions' do
     [ ['Draft', 'AXTextField', 'Edit', []],
       ['Password', 'AXSecureTextField', 'Edit', []],

@@ -17,6 +17,15 @@ Invoke directly: `blindly4 schema` lists options, risks and permissions; `--help
 
 ## Safe operation
 
+On Windows, activation first calls `SetForegroundWindow`. If Windows rejects that
+request, Blindly asks the target window's UI Automation provider to focus it.
+Composition panes can acknowledge focus without activating; if necessary, Blindly
+focuses the first enabled, keyboard-focusable content control inside that window.
+`activate --profile` reports these results and the foreground PID before and after
+the request. An accepted request is not proof of activation: the actual foreground
+PID must still match before input is allowed. Denied activation reports window
+details without injecting keys or changing Windows focus settings.
+
 On Windows, `pid` identifies a native window owner, as in the original C# CLI. UI Automation's composed tree can include providers from other processes; those controls remain discoverable and actionable. A popup/fragment with a different reverse parent ends sibling traversal at that branch instead of aborting discovery. Foreground and pointer checks use Win32's actual window PID. If an app exposes a separate top-level WebView window, target that window's PID from `apps` for keyboard input; do not assume its outer host owns the foreground window.
 
 macOS discovery tolerates unavailable optional AX properties and action lists, as Swift did. Native action/write failures still return errors. Rich-text draft verification reads only the selected writer's own subtree.

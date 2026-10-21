@@ -54,7 +54,11 @@ pub fn command_help(command: &Command) -> Result<()> {
     crate::json(&command.metadata())
 }
 pub fn profile(elapsed: Duration) -> String {
-    json!({"elapsedMs": elapsed.as_millis(), "platform": "windows"}).to_string()
+    let mut value = json!({"elapsedMs": elapsed.as_millis(), "platform": "windows"});
+    if let Some(activation) = native::activation_profile() {
+        value["activation"] = activation;
+    }
+    value.to_string()
 }
 pub fn report_pid(_: bool) -> bool {
     true

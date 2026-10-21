@@ -1,12 +1,12 @@
 use crate::application::require_foreground;
 use crate::error::{Error, Result};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, thread::sleep, time::Duration};
+use std::{cell::RefCell, collections::BTreeMap, thread::sleep, time::Duration};
 use windows::{
     Win32::{
         Foundation::*,
-        System::Threading::*,
-        UI::{HiDpi::*, Input::KeyboardAndMouse::*, Shell::ShellExecuteW, WindowsAndMessaging::*},
+        System::{Com::*, Threading::*},
+        UI::{Accessibility::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::ShellExecuteW, WindowsAndMessaging::*},
     },
     core::{BOOL, PCWSTR, PWSTR},
 };
@@ -83,13 +83,69 @@ pub fn apps() -> Result<Vec<Value>> {
     let foreground = foreground_pid();
     Ok(groups.into_iter().map(|(pid, titles)| json!({"pid": pid, "name": process_name(pid), "bundleIdentifier": null, "frontmost": pid == foreground, "windows": titles})).collect())
 }
+thread_local! {
+    static ACTIVATION_PROFILE: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+pub fn activation_profile() -> Option<Value> {
+    ACTIVATION_PROFILE.with(|value| value.borrow_mut().take())
+}
 pub fn activate_native(pid: i32) -> Result<()> {
     let window = windows()?.into_iter().find(|w| w.pid == pid).ok_or_else(|| Error::access(format!("No visible window for PID {pid}")))?;
     unsafe {
         if IsIconic(window.handle).as_bool() {
-            let _ = ShowWindow(window.handle, SW_RESTORE);
+            let _ = ShowWindowAsync(window.handle, SW_RESTORE);
         }
-        let _ = SetForegroundWindow(window.handle);
+        let before = foreground_pid();
+        let direct = SetForegroundWindow(window.handle).as_bool();
+        // Ask the native accessibility provider to focus its own window when a
+        // background caller cannot activate it directly (e.g. composition WebViews).
+        // The shared activation path still verifies the actual foreground PID.
+        let mut provider_focus = false;
+        let mut control_focus = false;
+        if !direct {
+            let automation: windows::core::Result<IUIAutomation> = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER);
+            if let Ok(automation) = automation
+                && let Ok(element) = automation.ElementFromHandle(window.handle)
+            {
+                provider_focus = element.SetFocus().is_ok();
+                // Some composition roots acknowledge SetFocus without activating
+                // their native window. A focusable descendant routes the request
+                // through the content provider; never click or inject input here.
+                if foreground_pid() != pid
+                    && let Ok(focusable) = automation.CreatePropertyCondition(UIA_IsKeyboardFocusablePropertyId, &true.into())
+                    && let Ok(enabled) = automation.CreatePropertyCondition(UIA_IsEnabledPropertyId, &true.into())
+                    && let Ok(available) = automation.CreateAndCondition(&focusable, &enabled)
+                    && let Ok(pane) = automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &UIA_PaneControlTypeId.0.into())
+                    && let Ok(content) = automation.CreateNotCondition(&pane)
+                    && let Ok(condition) = automation.CreateAndCondition(&available, &content)
+                    && let Ok(control) = element.FindFirst(TreeScope_Descendants, &condition)
+                {
+                    control_focus = control.SetFocus().is_ok();
+                }
+            }
+        }
+        let activated = direct || provider_focus || control_focus;
+        ACTIVATION_PROFILE.with(|value| {
+            *value.borrow_mut() = Some(json!({"targetPid": pid, "foregroundBefore": before,
+                "directAccepted": direct, "providerFocusAccepted": provider_focus, "controlFocusAccepted": control_focus,
+                "activationAccepted": activated,
+                "foregroundAfterRequest": foreground_pid(),
+                "rootOwnerPid": window_pid(GetAncestor(window.handle, GA_ROOTOWNER)),
+                "rootOwnerWindow": format!("{:?}", GetAncestor(window.handle, GA_ROOTOWNER).0),
+                "ownerPid": window_pid(GetWindow(window.handle, GW_OWNER).unwrap_or_default()),
+                "ownerWindow": format!("{:?}", GetWindow(window.handle, GW_OWNER).unwrap_or_default().0)}));
+        });
+        if !activated {
+            let foreground = GetForegroundWindow();
+            return Err(Error::access(format!(
+                "Windows declined foreground activation: target PID {pid}, window {:?}, foreground PID {}, window {:?}, target style {:#x}, extended style {:#x}",
+                window.handle.0,
+                window_pid(foreground),
+                foreground.0,
+                GetWindowLongW(window.handle, GWL_STYLE),
+                GetWindowLongW(window.handle, GWL_EXSTYLE)
+            )));
+        }
     }
     Ok(())
 }
